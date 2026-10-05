@@ -25,9 +25,11 @@ a rendered video, or a single frame.
 """
 import copy
 import random
+from crypt import methods
 # Standard library
 from pathlib import Path
 from typing import Literal
+import os
 
 # Third-party libraries
 import mujoco as mj
@@ -152,7 +154,6 @@ def get_direction_vector(data: mj.MjData) -> npt.NDArray[np.float64]:
 
 def nn_input(data):
     """Returns the input for the nn"""
-    #ToDo talk with everybody about wether the input is good
     input = []
     # We input the distance to the target
     input.append(tl.distance_to_target(np.asarray(data.qpos[0:3]), np.asarray(TARGET_POSITION)))
@@ -162,9 +163,6 @@ def nn_input(data):
     input.extend(data.qpos[7:])
     # We input the hinge veloities
     input.extend(data.qvel[6:])
-    #ToDo, might be interesting to add some "clock"
-    # mechanism to the input?
-    input.extend([np.sin(data.time * 2.0)])
     return input
 
 
@@ -230,28 +228,87 @@ def make_random_weights(
 Fitness functions
 """
 
-FITNESS_FUNCTIONS = {
-    "efficiency": tl.fitness_distance_and_efficiency,
-    "locomotion": tl.fitness_survival_and_locomotion,
-    "direct": tl.fitness_direct_path,
-    "speed": tl.fitness_speed_to_target
-}
+# The fitness functions that we test in our experimetn
+FITNESS_FUNCTIONS = [
+    "efficiency",
+    "locomotion",
+    "direct",
+    "speed"]
+
+# Gives
+FITNESS_VALUES = {}
 
 def fitness_function(
     initial_position: npt.NDArray[np.float64],
     final_position: npt.NDArray[np.float64],
-    min_z_position
+    min_z_position,
+    function
 ) -> float:
+    """
+    Determines the fitness value of the individual fitness functions
+    (Easier to call and understand the code)
+    :param initial_position:
+    :param final_position:
+    :param min_z_position:
+    :param function:
+    :return:
+    """
     target = np.asarray(TARGET_POSITION)
-    fitness = 0
-    fitness += tl.fitness_delta_distance(initial_position, final_position, target)
+    fitness = None
+    #ToDo now all the functions are the same, we have to find out how
+    # we can derive the other data necisary
+    if function == "efficiency":
+        fitness = tl.fitness_delta_distance(initial_position, final_position, target)
+    elif function == "locomotion":
+        #ToDo
+        fitness = tl.fitness_delta_distance(initial_position, final_position, target)
+    elif function == "direct":
+        #ToDo
+        fitness = tl.fitness_delta_distance(initial_position, final_position, target)
+    elif function == "speed":
+        #ToDo
+        fitness = tl.fitness_delta_distance(initial_position, final_position, target)
     return fitness
+
+def fitness_per_method(individual: Individual, method:str)->float:
+    """
+    :param method: determines which method we use:
+    The individual functions:
+    locomotion, efficiency, direct, speed
+    The combined functions:
+    sum, threshold, self-adaptive
+    :return:
+    """
+    if method == "locomotion":
+        return individual.tags["locomotion"]
+    elif method == "efficiency":
+        return individual.tags["efficiency"]
+    elif method == "direct":
+        return individual.tags["direct"]
+    elif method == "speed":
+        return individual.tags["speed"]
+    elif method == "sum":
+        # we determine the values
+        values = [v for v in individual.tags.values()]
+        return sum(values)
+    elif method == "threshold":
+        #ToDo create the threshold function
+        return 10
+    elif method == "self-adaptive":
+        #ToDo create the self adaptive function
+        return 10
+    raise ValueError(f"Unknown method: {method}")
 
 """
 Evaluation
 """
 
 def evaluate_individual(weights: np.ndarray) -> (np.ndarray, float):
+    """
+    Determines the fitness of an individual.
+    :param weights:
+    :return: weights, fitness_dictionary
+    """
     # MuJoCo's control callback is a GLOBAL. Clear it. DO NOT REMOVE.
     mj.set_mjcb_control(None)
 
@@ -314,23 +371,29 @@ def evaluate_individual(weights: np.ndarray) -> (np.ndarray, float):
     # --- Score -------------------------------------------------------------- #
     final_position = get_core_position(data)
     min_z_position = min_z
-    fitness = fitness_function(initial_position, final_position, min_z_position)
-    return weights, fitness
+    # We calculate the fitness w.r.t. all the fitness functions
+    fitness_dictionary = {}
+    for func in FITNESS_FUNCTIONS:
+        fitness_dictionary[func] = fitness_function(initial_position, final_position, min_z_position, func)
+    return weights, fitness_dictionary
 """
 Initialization
 """
 
-def initialize_population(population_size:int=100) -> Population:
+def initialize_population(population_size:int=100,method:str = "locomotion") -> Population:
     # We randomly intitialize n bodies
     population = []
-    for _ in range(population_size):
+    for i in range(population_size):
         # For this genome, we create a individual
         ind = Individual()
         # We randomly create weights and evaluate their fitness
-        weights, fitness = evaluate_individual(None)
+        weights, fitness_dictionary = evaluate_individual(None)
         # We assign these to the individual
         ind.genotype = weights
-        ind.fitness = fitness
+        # We assign an index to the individuals for eay representation
+        fitness_dictionary["index"] = i
+        ind.tags = fitness_dictionary
+        ind.fitness = fitness_per_method(ind, method)
         # We add the individual to the population
         population.append(ind)
     # We then create a population object and return it
@@ -356,7 +419,7 @@ def crossover(weights):
     w2p2[:cut_2] = w2p1[:cut_2]
     return weights
 
-def mutate(weights, sigma: float = 0.2, rate: float = 0.1):
+def mutate(weights, sigma: float = 0.2, rate: float = 1):
     """Gaussian mutation: each weight is perturbed with probability `rate`.
 
     Returns a new list of arrays; the input is left untouched.
@@ -369,9 +432,11 @@ def mutate(weights, sigma: float = 0.2, rate: float = 0.1):
     return mutated
 
 
-def reproduction(population: Population, children_fraction: float = 0.25, tournament_size:int = 10, parent_amount:int =2) -> Population:
+def reproduction(population: Population, children_fraction: float = 0.25, tournament_size:int = 10, parent_amount:int =2, method:str = "locomotion") -> Population:
     # We determine how many children we want in our population
     n_children = round(children_fraction * len(population))
+    # We keep check of our children
+    children = []
     # We perform tournament selection this amount of times
     for _ in range(n_children):
         # We take some random sample from the population
@@ -387,16 +452,24 @@ def reproduction(population: Population, children_fraction: float = 0.25, tourna
         for w in weights_children:
             individual = Individual()
             mutated_weight = mutate(w)
-            w_out, fitness = evaluate_individual(mutated_weight)
+            w_out, fitness_dict = evaluate_individual(mutated_weight)
             individual.genotype = w_out
-            individual.fitness = fitness
+            individual.tags = fitness_dict
+            individual.fitness = fitness_dict[method]
             # We add the children to the population
             population.append(individual)
+            children.append(individual)
 
     # We then kill of the individuals with the worst fitness
     worst = population.best(sort = "max", n=int(n_children*parent_amount))
     for ind in worst:
         ind.alive = False
+    # We need to find the slots for our matrix creation (children have no index yet)
+    free_slots = [ind.tags["index"] for ind in worst if "index" in ind.tags]
+    # Surviving children take over those slots
+    for child in children:
+        if child.alive:
+            child.tags["index"] = free_slots.pop()
     return population.alive
 
 """
@@ -437,6 +510,7 @@ def show_behavior(individual: Individual, filename = "test"):
         # d.ctrl[:] += actions * delta
         # d.ctrl[:] = np.clip(d.ctrl, -np.pi / 2, np.pi / 2)
 
+    os.makedirs(DATA/"__videos__", exist_ok=True)
     mj.set_mjcb_control(control_callback)
     recorder = VideoRecorder(file_name=filename, output_folder=str(DATA / "__videos__"))
     video_renderer(
@@ -447,17 +521,83 @@ def show_behavior(individual: Individual, filename = "test"):
     )
     mj.set_mjcb_control(None)
 
-if __name__ == "__main__":
-    pop = initialize_population(50)
+"""
+Experimental setup
+"""
+
+METHODS= ["locomotion",
+           "speed",
+           "efficiency",
+           "direct",
+           "sum",
+           "threshold",
+           "self-adaptive"]
+
+def form_matrix(population:Population)->np.array:
+    """
+    Turns the fitness values of the population into a matrix
+    """
+    # We go over all the individuals in the population
+    # represent their fitness dictionary as a colmn of a matrix
+    matrix = np.zeros((len(population), len(FITNESS_FUNCTIONS)), dtype=float)
+    for ind in population:
+        dictionary = ind.tags
+        i = dictionary["index"]
+        values = [dictionary[f] for f in FITNESS_FUNCTIONS]
+        matrix[i,:] = values
+    return matrix
+
+
+def individual_experimental(pop_size:int, time:int, seed:int, method:str="locomotion"):
+    """
+    This is where we call each individual experiment
+    """
+    pop = initialize_population(population_size=pop_size, method=method)
     best = pop.best(sort="min", n=1)[0]
-    print(best.fitness)
     show_behavior(best, "start")
-    for _ in range(50):
+    history = [form_matrix(pop)]
+    for i in range(time):
+        if i % 10 == 0: print(".", end="")
         pop = reproduction(pop)
-        best = pop.best(sort="min", n=1)[0]
-        print(best.fitness)
+        history.append(form_matrix(pop))
+    history = np.stack(history)
+    np.save(DATA / "__history__" / f"{method}_seed{seed}.npy", history)
+    best = pop.best(sort="min", n=1)[0]
     show_behavior(best, "finish")
 
+def statistics(method:str, seed: int):
+    #ToDo make the statistic statisizing
+    # history has the form  (generations, pop_size, n_fitness_functions)
+    history = np.load(DATA / "__history__"/ f"{method}_seed{seed}.npy")
+
+def experimental_run(pop_size, time, amount_of_runs, initial_seed = 42):
+    """
+    This is where we run our experiment
+    """
+    global RNG
+    os.makedirs(DATA/"__history__", exist_ok=True)
+    # We define the different types of methods that we
+    # want to test in our experiment:
+    for method in METHODS:
+        print("="*50)
+        print(f"Running for method: {method}")
+        seed = initial_seed
+        for i in range(amount_of_runs):
+            RNG = np.random.default_rng(seed)
+            set_seed(seed)
+            print(f"Experiment {i}:", end = " ")
+            individual_experimental(pop_size, time, seed, method=method)
+            seed += 1
+            print("complete")
+    print("="*50)
+    print("Experiment complete")
+
+
+if __name__ == "__main__":
+    # experimental_run(5, 5, amount_of_runs=2, initial_seed=42)
+    for method in METHODS:
+        history = np.load(DATA / "__history__" / f"{method}_seed{42}.npy")
+        print(history.shape)
 
 # ============================================================================ #
 #  YOUR JOB
