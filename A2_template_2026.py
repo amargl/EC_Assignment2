@@ -34,7 +34,6 @@ import mujoco as mj
 import numpy as np
 import numpy.typing as npt
 from mujoco import viewer
-from networkx.algorithms import tournament
 
 # Local libraries (ARIEL)
 from ariel import console
@@ -75,8 +74,9 @@ DATA.mkdir(parents=True, exist_ok=True)
 
 # --- EXPERIMENT CONSTANTS --- #
 SPAWN_POS: list[float] = [0.0, 0.0, 0.1]  # where the robot starts
+#ToDo discuss whether we want changeing target positions
+# I think it would be unnecisarry work and difficult to explain why we chose it in the paper
 TARGET_POSITION: list[float] = [2.0, 0.0, 0.1]  # where it should end up
-MAX_FITNESS = tl._xy_distance(SPAWN_POS,TARGET_POSITION)
 SIM_DURATION: float = 10.0  # seconds of simulated time per evaluation
 MODE: ViewerTypes = "launcher"  # see run_experiment() for the options
 
@@ -141,6 +141,32 @@ def build_robot() -> CoreModule:
 # Controller architecture - decide before writing your EA.
 HIDDEN_SIZE: int = 6
 
+def get_core_position(data: mj.MjData) -> npt.NDArray[np.float64]:
+    """Return the robot core's current (x, y, z) world position."""
+    return np.asarray(data.qpos[0:3]).copy()
+
+def get_direction_vector(data: mj.MjData) -> npt.NDArray[np.float64]:
+    """Return the vector that determines the direction from the
+    Robots core to the target."""
+    return  np.asarray(TARGET_POSITION) - np.asarray(data.qpos[0:3])
+
+def nn_input(data):
+    """Returns the input for the nn"""
+    #ToDo talk with everybody about wether the input is good
+    input = []
+    # We input the distance to the target
+    input.append(tl.distance_to_target(np.asarray(data.qpos[0:3]), np.asarray(TARGET_POSITION)))
+    # We input the direction to the target
+    input.extend(get_direction_vector(data))
+    # We input the hinge angles
+    input.extend(data.qpos[7:])
+    # We input the hinge veloities
+    input.extend(data.qvel[6:])
+    #ToDo, might be interesting to add some "clock"
+    # mechanism to the input?
+    input.extend([np.sin(data.time * 2.0)])
+    return input
+
 
 def nn_controller(
     model: mj.MjModel,
@@ -171,9 +197,8 @@ def nn_controller(
     w1, w2 = weights
 
     # --- INPUTS ---------------------------------------------------------- #
-    # Bare qpos - the simplest choice, not necessarily a good one. See
-    # YOUR JOB below.
-    inputs = data.qpos
+    # We apply the direction of the target as the input data.
+    inputs = nn_input(data)
 
     # --- FORWARD PASS ----------------------------------------------------- #
     layer1 = np.tanh(inputs @ w1)
@@ -226,11 +251,6 @@ def fitness_function(
 Evaluation
 """
 
-#ToDo change current to vector to target
-def get_core_position(data: mj.MjData) -> npt.NDArray[np.float64]:
-    """Return the robot core's current (x, y, z) world position."""
-    return np.asarray(data.qpos[0:3]).copy()
-
 def evaluate_individual(weights: np.ndarray) -> (np.ndarray, float):
     # MuJoCo's control callback is a GLOBAL. Clear it. DO NOT REMOVE.
     mj.set_mjcb_control(None)
@@ -257,9 +277,12 @@ def evaluate_individual(weights: np.ndarray) -> (np.ndarray, float):
     # we create random weights
     if weights is None:
         # --- Wire up the controller -------------------------------------------- #
+        # We only perform this when the individual currently has no weights.
+        # This is only the case for initialization
         # Sizes are read from the compiled model, never hardcoded - they depend on
-        # the body you chose in build_robot().
-        input_size = len(data.qpos)
+        # the body you chose in build_robot()
+        input_example = nn_input(data)
+        input_size = len(input_example)
         output_size = model.nu
 
         weights = make_random_weights(input_size, output_size)
@@ -329,6 +352,8 @@ def crossover(weights):
     # And perform crossover
     w1p1[:cut_1] = w1p2[:cut_1]
     w2p1[:cut_2] = w2p2[:cut_2]
+    w1p2[:cut_1] = w1p1[:cut_1]
+    w2p2[:cut_2] = w2p1[:cut_2]
     return weights
 
 def mutate(weights, sigma: float = 0.2, rate: float = 0.1):
@@ -423,7 +448,7 @@ def show_behavior(individual: Individual, filename = "test"):
     mj.set_mjcb_control(None)
 
 if __name__ == "__main__":
-    pop = initialize_population(80)
+    pop = initialize_population(50)
     best = pop.best(sort="min", n=1)[0]
     print(best.fitness)
     show_behavior(best, "start")
