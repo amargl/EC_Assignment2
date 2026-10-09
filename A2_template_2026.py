@@ -297,11 +297,15 @@ def fitness_function( #is there a way to make this more efficient?
     :return:
     """
     target = np.asarray(TARGET_POSITION)
+    
     fitness = None
+    
     ### changed fitness functions to the four we wanted, added necessary params to def and in the implementation below
     # we can derive the other data necisary
     if function == "efficiency":
-        fitness = tl.fitness_distance_and_efficiency(initial_position, final_position, target, total_control_effort)
+        ###changed this
+        fitness = tl.fitness_delta_distance(initial_position, final_position, target) + 0.5 * total_control_effort
+        #fitness = tl.fitness_distance_and_efficiency(initial_position, final_position, target, total_control_effort)
     elif function == "locomotion":
         fitness = tl.fitness_survival_and_locomotion(initial_position, final_position, target, min_z_position)
     elif function == "direct":
@@ -445,8 +449,10 @@ def evaluate_individual(weights: np.ndarray):
 
     # # We want to normalize the effort so that it is not over represented in our
     # # evolution
-    # max_effort = sim_steps * model.nu * (np.pi / 2) ** 2
-    # normalised_effort = total_control_effort / max_effort
+    ### fleming meinte besser so:
+    
+    max_effort = sim_steps * model.nu * (np.pi / 2) ** 2
+    normalised_effort = total_control_effort / max_effort
 
     duration = sim_steps * model.opt.timestep
     # --- Score -------------------------------------------------------------- #
@@ -456,7 +462,7 @@ def evaluate_individual(weights: np.ndarray):
     # We calculate the fitness w.r.t. all the fitness functions
     fitness_dictionary = {}
     for func in FITNESS_FUNCTIONS:
-        raw = fitness_function(initial_position, final_position, total_control_effort,
+        raw = fitness_function(initial_position, final_position, normalised_effort , ###total_control_effort
                                min_z_position, total_path_length, time_to_target,
                                duration, min_distance_to_target, func)
         fitness_dictionary[func] = normalise(raw, func)
