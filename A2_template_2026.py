@@ -711,7 +711,7 @@ def reproduction(population: Population, n_children=2, tournament_size:int = 4, 
 Launch Ariel
 """
 
-def show_behavior(individual: Individual, filename = "test"):
+def show_behavior(individual: Individual, filename = "test", render=True):
     world = build_world()
     robot = build_robot()
 
@@ -749,14 +749,19 @@ def show_behavior(individual: Individual, filename = "test"):
 
     os.makedirs(DATA/"__videos__", exist_ok=True)
     mj.set_mjcb_control(control_callback)
-    recorder = VideoRecorder(file_name=filename, output_folder=str(DATA / "__videos__"))
-    video_renderer(
-        model,
-        data,
-        duration=SIM_DURATION,
-        video_recorder=recorder,
-    )
-    mj.set_mjcb_control(None)
+    ###changed this part to make it easier in snellius, will not make us the nice gecko videos sadly
+    try:
+        # Skip video rendering on headless HPC nodes
+        if render:
+            recorder = VideoRecorder(file_name=filename, output_folder=str(DATA / "__videos__"))
+            video_renderer(
+                model,
+                data,
+                duration=SIM_DURATION,
+                video_recorder=recorder,
+            )
+    finally:
+        mj.set_mjcb_control(None)
 
 """
 Experimental setup
@@ -792,7 +797,7 @@ def individual_experimental(pop_size:int, time:int, seed:int, method:str="locomo
     HISTORY = []
     pop = initialize_population(population_size=pop_size, method=method)
     best = pop.best(sort="min", n=1)[0]
-    show_behavior(best, f"{method}_start")
+    show_behavior(best, f"{method}_start", render=False)
     HISTORY = [form_matrix(pop)]
     for i in range(time):
         if i % 10 == 0: print(".", end="")
@@ -804,7 +809,7 @@ def individual_experimental(pop_size:int, time:int, seed:int, method:str="locomo
     np.save(DATA / "__history__" / f"{method}_seed{seed}.npy", HISTORY)
     if show_robot:
         best = pop.best(sort="min", n=1)[0]
-        show_behavior(best, f"{method}_finish")
+        show_behavior(best, f"{method}_finish", render=False)
 
 def statistics(method:str, seed: int):
     #ToDo make the statistic statisizing
@@ -885,7 +890,7 @@ def experimental_run(pop_size, time, amount_of_runs, initial_seed = 42):
 
 
 if __name__ == "__main__":
-    experimental_run(pop_size=80, time=2000, amount_of_runs=5, initial_seed=42)
+    experimental_run(pop_size=80, time=2, amount_of_runs=5, initial_seed=42)
 
     # for method in METHODS:
     #     history = np.load(DATA / "__history__" / f"{method}_seed{42}.npy")
@@ -997,4 +1002,3 @@ if __name__ == "__main__":
 #
 #     # Mean rate of change
 #     return changes.mean()
-
