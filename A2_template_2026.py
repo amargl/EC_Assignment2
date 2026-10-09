@@ -48,6 +48,7 @@ from ariel.utils.runners import simple_runner
 from ariel.utils.video_recorder import VideoRecorder
 
 import ariel.simulation.tasks.targeted_locomotion as tl
+import matplotlib.pyplot as plt
 
 from ariel.ec import (
     Individual,
@@ -62,6 +63,7 @@ type ViewerTypes = Literal["launcher", "video", "simple", "frame", "no_control"]
 # Report results over MULTIPLE seeds.
 SEED = 42
 RNG = np.random.default_rng(SEED)
+random.seed(SEED)
 
 # ariel.ec's own generators/mutators/crossover draw from a separate,
 # package-level RNG. Reseed it too if you build your EA on ariel.ec,
@@ -81,7 +83,7 @@ SPAWN_POS: list[float] = [0.0, 0.0, 0.1]  # where the robot starts
 TARGET_POSITION: list[float] = [2.0, 0.0, 0.1]  # where it should end up
 SIM_DURATION: float = 10.0  # seconds of simulated time per evaluation
 MODE: ViewerTypes = "launcher"  # see run_experiment() for the options
-
+HISTORY = []
 
 # ============================================================================ #
 #  1. THE BODY AND THE WORLD
@@ -230,18 +232,42 @@ Fitness functions
 
 # The fitness functions that we test in our experimetn
 FITNESS_FUNCTIONS = [
-    "efficiency",
     "locomotion",
     "direct",
-    "speed"]
+    "speed",
+    "efficiency"]
+
+PARAMETERS = ["w_" + f for f in FITNESS_FUNCTIONS]
+COLUMNS = FITNESS_FUNCTIONS + PARAMETERS
+
+# These are relevent for our threshold adaptation
+STAGES = [
+    {"locomotion": 1},
+    {"locomotion": .5, "direct": .5},
+    {"direct": 1},
+    {"direct": .5, "speed": .5},
+    {"speed": 1},
+    {"speed": .5, "efficiency": .5},
+    {"efficiency": 1},
+]
+LOOKBACK = 10
+RATE_THRESHOLD = 0.1
+STAGE = 0
+BEST_IN_STAGE: list[float] = []
+
+AMOUNT_OF_FUNCTIONS = len(FITNESS_FUNCTIONS)
 
 # Gives
 FITNESS_VALUES = {}
-
-def fitness_function(
+def fitness_function( #is there a way to make this more efficient?
     initial_position: npt.NDArray[np.float64],
     final_position: npt.NDArray[np.float64],
-    min_z_position,
+    total_control_effort: float,
+    min_z_position: float,
+    total_path_length: float,
+    time_to_target: float | None,
+    duration: float,
+    min_distance_to_target: float,
     function
 ) -> float:
     """
@@ -255,55 +281,31 @@ def fitness_function(
     """
     target = np.asarray(TARGET_POSITION)
     fitness = None
-    #ToDo now all the functions are the same, we have to find out how
+    ### changed fitness functions to the four we wanted, added necessary params to def and in the implementation below
     # we can derive the other data necisary
     if function == "efficiency":
-        fitness = tl.fitness_delta_distance(initial_position, final_position, target)
+        fitness = tl.fitness_distance_and_efficiency(initial_position, final_position, target, total_control_effort)
     elif function == "locomotion":
-        #ToDo
-        fitness = tl.fitness_delta_distance(initial_position, final_position, target)
+        fitness = tl.fitness_survival_and_locomotion(initial_position, final_position, target, min_z_position)
     elif function == "direct":
-        #ToDo
-        fitness = tl.fitness_delta_distance(initial_position, final_position, target)
+        fitness = tl.fitness_direct_path(initial_position, final_position, target, total_path_length)
     elif function == "speed":
-        #ToDo
-        fitness = tl.fitness_delta_distance(initial_position, final_position, target)
+        fitness = tl.fitness_speed_to_target(time_to_target,duration, min_distance_to_target)
     return fitness
 
-def fitness_per_method(individual: Individual, method:str)->float:
-    """
-    :param method: determines which method we use:
-    The individual functions:
-    locomotion, efficiency, direct, speed
-    The combined functions:
-    sum, threshold, self-adaptive
-    :return:
-    """
-    if method == "locomotion":
-        return individual.tags["locomotion"]
-    elif method == "efficiency":
-        return individual.tags["efficiency"]
-    elif method == "direct":
-        return individual.tags["direct"]
-    elif method == "speed":
-        return individual.tags["speed"]
-    elif method == "sum":
-        # we determine the values
-        values = [v for v in individual.tags.values()]
-        return sum(values)
-    elif method == "threshold":
-        #ToDo create the threshold function
-        return 10
-    elif method == "self-adaptive":
-        #ToDo create the self adaptive function
-        return 10
-    raise ValueError(f"Unknown method: {method}")
+def fitness(individual: Individual, method: str) -> float:
+    # We take the sum off all these values
+    fitness_value = individual.tags["locomotion"] * individual.tags["w_locomotion"]
+    fitness_value += individual.tags["efficiency"] * individual.tags["w_efficiency"]
+    fitness_value += individual.tags["direct"] * individual.tags["w_direct"]
+    fitness_value += individual.tags["speed"] * individual.tags["w_speed"]
+    return fitness_value
 
 """
 Evaluation
 """
 
-def evaluate_individual(weights: np.ndarray) -> (np.ndarray, float):
+def evaluate_individual(weights: np.ndarray):
     """
     Determines the fitness of an individual.
     :param weights:
@@ -344,10 +346,14 @@ def evaluate_individual(weights: np.ndarray) -> (np.ndarray, float):
 
         weights = make_random_weights(input_size, output_size)
 
+
     def control_callback(m: mj.MjModel, d: mj.MjData) -> None:
         """Compute and apply actions; MuJoCo calls this every physics step."""
-        actions = nn_controller(m, d, weights)
-
+        if len(weights) == 2:
+            actions = nn_controller(m, d, weights)
+        else:
+            w1,w2, a = weights
+            actions = nn_controller(m, d, (w1,w2))
         # DIRECT application (see the controller contract above).
         d.ctrl[:] = actions
 
@@ -362,19 +368,74 @@ def evaluate_individual(weights: np.ndarray) -> (np.ndarray, float):
     mj.set_mjcb_control(control_callback)   # register BEFORE stepping
 
     sim_steps = int(SIM_DURATION / model.opt.timestep)
-    min_z = np.inf
-    for _ in range(sim_steps):
-        mj.mj_step(model, data)
-        min_z = min(min_z, data.qpos[2])
+    # Fitness measurements
+    total_control_effort = 0.0
+    total_path_length = 0.0
+    min_z_position = np.inf
+    min_distance_to_target = np.inf
+    time_to_target = None
 
-    mj.set_mjcb_control(None)
+    target = np.asarray(TARGET_POSITION)
+
+    # How close the robot needs to be to count as reaching the target.
+    # do we have instructions on hwo to define this?
+    TARGET_THRESHOLD = 0.1
+
+    previous_position = get_core_position(data)
+
+    for step in range(sim_steps):
+        mj.mj_step(model, data)
+
+        current_position = get_core_position(data)
+
+        # ---------------------------------------------------------
+        # Height
+        # ---------------------------------------------------------
+        min_z_position = min(min_z_position,current_position[2])
+
+        # ---------------------------------------------------------
+        # Total path length
+        # Only count horizontal (x,y) movement.
+        # ---------------------------------------------------------
+        step_distance = np.linalg.norm(current_position[:2] - previous_position[:2])
+        total_path_length += step_distance
+        previous_position = current_position
+
+        # ---------------------------------------------------------
+        # Control effort
+        # ---------------------------------------------------------
+        total_control_effort += np.sum(data.ctrl ** 2)
+
+        # ---------------------------------------------------------
+        # Distance to target
+        # Only x,y, matching the fitness functions.
+        # ---------------------------------------------------------
+        distance_to_target = np.linalg.norm(
+            current_position[:2] - target[:2]
+        )
+
+        min_distance_to_target = min(min_distance_to_target,distance_to_target)
+
+        # ---------------------------------------------------------
+        # Time to target
+        # ---------------------------------------------------------
+        if (
+            time_to_target is None
+            and distance_to_target <= TARGET_THRESHOLD
+        ):
+            time_to_target = ((step + 1) * model.opt.timestep)
+
+    duration = sim_steps * model.opt.timestep
     # --- Score -------------------------------------------------------------- #
     final_position = get_core_position(data)
-    min_z_position = min_z
+    # --- Score -------------------------------------------------------------- #
+    mj.set_mjcb_control(None)
     # We calculate the fitness w.r.t. all the fitness functions
     fitness_dictionary = {}
     for func in FITNESS_FUNCTIONS:
-        fitness_dictionary[func] = fitness_function(initial_position, final_position, min_z_position, func)
+        fitness_dictionary[func] = fitness_function(initial_position, final_position, total_control_effort,
+                                                    min_z_position, total_path_length, time_to_target, duration,
+                                                    min_distance_to_target, func)
     return weights, fitness_dictionary
 """
 Initialization
@@ -388,38 +449,130 @@ def initialize_population(population_size:int=100,method:str = "locomotion") -> 
         ind = Individual()
         # We randomly create weights and evaluate their fitness
         weights, fitness_dictionary = evaluate_individual(None)
+        # We add w_locomotion, w_efficiency, w_direct, w_speed to our dictionary (and to weights in case
+        # of self adaptation)
+        weights, tag = assign_parameter_weights(weights, fitness_dictionary, method)
         # We assign these to the individual
         ind.genotype = weights
         # We assign an index to the individuals for eay representation
-        fitness_dictionary["index"] = i
-        ind.tags = fitness_dictionary
-        ind.fitness = fitness_per_method(ind, method)
+        tag["index"] = i
+        ind.tags = tag
+        ind.fitness = fitness(ind, method)
         # We add the individual to the population
         population.append(ind)
     # We then create a population object and return it
     return Population(population)
 
+def assign_parameter_weights(weights, tag, method):
+    """"
+    Adds w_locomotion, w_efficiency, w_direct, w_speed to the fitness (and in case of the
+    self adaptation) to the weights, depending on which method we use
+    """
+    global PARAMETERS
+    values = np.zeros(len(PARAMETERS))
+    if method == "locomotion":
+        index = FITNESS_FUNCTIONS.index("locomotion")
+        values[index] = 1
+    elif method == "efficiency":
+        index = FITNESS_FUNCTIONS.index("efficiency")
+        values[index] = 1
+    elif method == "direct":
+        index = FITNESS_FUNCTIONS.index("direct")
+        values[index] = 1
+    elif method == "speed":
+        index = FITNESS_FUNCTIONS.index("speed")
+        values[index] = 1
+    elif method == "sum":
+        # We want the sum to be normalized (more consistent)
+        values = [0.25, 0.25, 0.25, 0.25]
+    elif method == "threshold":
+        values = values_for_threshold()
+    elif method == "self-adaptive":
+        if len(weights) == 2:
+            # At the initialisation, the values are
+            # uniform
+            values = [0.25, 0.25, 0.25, 0.25]
+            w1, w2 = weights
+            weights = (w1,w2, values)
+        else:
+            # Otherwise we take the values
+            w1,w2,values = weights
+            val = np.array(values)
+            # First we make sure that all values are positive
+            min_val = np.min(val)
+            if min_val < 0:
+                val = val + abs(min_val)
+            # We normalize the values
+            normalized = (val - val.min()) / (val.max() - val.min())
+            values = list(normalized)
+    # We then add the parameter weights to the tag of the
+    # individual
+    for i, p in enumerate(PARAMETERS):
+        tag[p] = values[i]
+    return weights, tag
+
+"""
+
+"""
+
+"""
+Threshold adaptation
+"""
+
+def reset_threshold_state():
+    """Call at the start of every run"""
+    global STAGE, BEST_IN_STAGE
+    STAGE = 0
+    BEST_IN_STAGE = []
+
+def values_for_threshold() -> list[float]:
+    """Weights of the current stage, in the same order as PARAMETERS."""
+    return [float(STAGES[STAGE].get(f, 0.0)) for f in FITNESS_FUNCTIONS]
+
+
+def update_threshold_stage(pop) -> bool:
+    """
+    Records the best fitness, and if progress has stalled, moves to the next
+    stage and rescores the whole population (no re-simulation needed, the raw
+    values are in the tags). Returns True if the stage advanced.
+    """
+    global STAGE, BEST_IN_STAGE
+    BEST_IN_STAGE.append(pop.best(sort="min", n=1)[0].fitness)
+
+    if STAGE > len(STAGES)  or len(BEST_IN_STAGE) <= LOOKBACK:
+        return False
+
+    recent = BEST_IN_STAGE[-(LOOKBACK + 1):]
+    rate = np.mean(np.diff(recent))
+    if rate <= -RATE_THRESHOLD:
+        return False
+
+    STAGE += 1
+    values = values_for_threshold()
+    for ind in pop:
+        for p, v in zip(PARAMETERS, values):
+            ind.tags[p] = v
+        ind.fitness = fitness(ind, "threshold")
+    BEST_IN_STAGE = [min(ind.fitness for ind in pop)]
+    return True
+
 """
 Evolutionary steps
 """
 
-def crossover(weights):
-    # 1 point crossover for 2 parents
-    # We deepcopy the weights
-    weights = [copy.deepcopy(w) for w in weights]
-    # We then perform the crossover for the weights
-    w1p1, w2p1 = weights[0]
-    w1p2, w2p2 = weights[1]
-    cut_1 = random.randint(1, len(w1p1) - 2)
-    cut_2 = random.randint(1, len(w2p1) - 2)
-    # And perform crossover
-    w1p1[:cut_1] = w1p2[:cut_1]
-    w2p1[:cut_2] = w2p2[:cut_2]
-    w1p2[:cut_1] = w1p1[:cut_1]
-    w2p2[:cut_2] = w2p1[:cut_2]
-    return weights
+def crossover(parents):
+    """
+    Simple one point crossover for two parents
+    """
+    p1, p2 = parents
+    c1, c2 = [], []
+    for a, b in zip(p1, p2):
+        cut = int(RNG.integers(1, len(a)))
+        c1.append(np.concatenate([b[:cut], a[cut:]]))
+        c2.append(np.concatenate([a[:cut], b[cut:]]))
+    return [c1, c2]
 
-def mutate(weights, sigma: float = 0.2, rate: float = 1):
+def mutate(weights, sigma: float = 0.1, rate: float = 1):
     """Gaussian mutation: each weight is perturbed with probability `rate`.
 
     Returns a new list of arrays; the input is left untouched.
@@ -432,30 +585,34 @@ def mutate(weights, sigma: float = 0.2, rate: float = 1):
     return mutated
 
 
-def reproduction(population: Population, children_fraction: float = 0.25, tournament_size:int = 10, parent_amount:int =2, method:str = "locomotion") -> Population:
-    # We determine how many children we want in our population
-    n_children = round(children_fraction * len(population))
+def reproduction(population: Population, n_children=2, tournament_size:int = 4, parent_amount:int =2, method:str = "locomotion") -> Population:
     # We keep check of our children
     children = []
     # We perform tournament selection this amount of times
     for _ in range(n_children):
-        # We take some random sample from the population
-        tournament = population.sample(tournament_size)
-        # We find the fittest in the population
-        parents = tournament.best(sort = "min", n=parent_amount)
-        parents = parents.to_list()
+        parents = []
+        # We perform n tournements
+        for _ in range(parent_amount):
+            # We take some random sample from the population
+            tournament = population.sample(tournament_size)
+            # We find the fittest in the population
+            parents.extend(tournament.best(sort = "min", n=1))
         # We set the weights and fitness for all parents in an array
         weights = [p.genotype for p in parents]
         # We perform crossover to the parents
         weights_children = crossover(weights)
         # We create individuals using these weights and fitnesses
-        for w in weights_children:
+        for i,w in enumerate(weights_children):
             individual = Individual()
             mutated_weight = mutate(w)
+            # We evaluate the new values of the fitness
             w_out, fitness_dict = evaluate_individual(mutated_weight)
-            individual.genotype = w_out
-            individual.tags = fitness_dict
-            individual.fitness = fitness_dict[method]
+            # We update the parameters
+            # We give one parent for the copy of parameter values
+            new_weights, tag = assign_parameter_weights(w_out,fitness_dict, method)
+            individual.genotype = new_weights
+            individual.tags = tag
+            individual.fitness = fitness(individual, method)
             # We add the children to the population
             population.append(individual)
             children.append(individual)
@@ -470,6 +627,8 @@ def reproduction(population: Population, children_fraction: float = 0.25, tourna
     for child in children:
         if child.alive:
             child.tags["index"] = free_slots.pop()
+
+    print(population.best(sort = "min", n=1)[0].fitness)
     return population.alive
 
 """
@@ -498,9 +657,8 @@ def show_behavior(individual: Individual, filename = "test"):
 
     def control_callback(m: mj.MjModel, d: mj.MjData) -> None:
         """Compute and apply actions; MuJoCo calls this every physics step."""
-        actions = nn_controller(m, d, weights)
-    #ToDo this is just a random crossover implementation for testing
-    # It splits the two weight vectors in two and performs crossover
+        w1, w2, a = weights
+        actions = nn_controller(m, d, (w1,w2))
 
         # DIRECT application (see the controller contract above).
         d.ctrl[:] = actions
@@ -533,18 +691,15 @@ METHODS= ["locomotion",
            "threshold",
            "self-adaptive"]
 
-def form_matrix(population:Population)->np.array:
+def form_matrix(population:Population) -> np.array:
     """
     Turns the fitness values of the population into a matrix
     """
     # We go over all the individuals in the population
     # represent their fitness dictionary as a colmn of a matrix
-    matrix = np.zeros((len(population), len(FITNESS_FUNCTIONS)), dtype=float)
+    matrix = np.zeros((len(population), len(COLUMNS)))
     for ind in population:
-        dictionary = ind.tags
-        i = dictionary["index"]
-        values = [dictionary[f] for f in FITNESS_FUNCTIONS]
-        matrix[i,:] = values
+        matrix[ind.tags["index"], :] = [ind.tags[c] for c in COLUMNS]
     return matrix
 
 
@@ -552,30 +707,68 @@ def individual_experimental(pop_size:int, time:int, seed:int, method:str="locomo
     """
     This is where we call each individual experiment
     """
+    global HISTORY
+    reset_threshold_state()
+    os.makedirs(DATA/"__history__", exist_ok=True)
+    HISTORY = []
     pop = initialize_population(population_size=pop_size, method=method)
     best = pop.best(sort="min", n=1)[0]
     show_behavior(best, "start")
-    history = [form_matrix(pop)]
+    HISTORY = [form_matrix(pop)]
     for i in range(time):
         if i % 10 == 0: print(".", end="")
-        pop = reproduction(pop)
-        history.append(form_matrix(pop))
-    history = np.stack(history)
-    np.save(DATA / "__history__" / f"{method}_seed{seed}.npy", history)
+        pop = reproduction(pop, method=method)
+        if method == "threshold":
+            update_threshold_stage(pop)
+        HISTORY.append(form_matrix(pop))
+    HISTORY = np.stack(HISTORY)
+    np.save(DATA / "__history__" / f"{method}_seed{seed}.npy", HISTORY)
     best = pop.best(sort="min", n=1)[0]
     show_behavior(best, "finish")
 
 def statistics(method:str, seed: int):
     #ToDo make the statistic statisizing
     # history has the form  (generations, pop_size, n_fitness_functions)
-    history = np.load(DATA / "__history__"/ f"{method}_seed{seed}.npy")
+    history = np.load(DATA / "__history__" / f"{method}_seed{seed}.npy")
+    # history: (generations, pop_size, len(COLUMNS))
+
+    n = len(FITNESS_FUNCTIONS)
+    time = np.arange(history.shape[0])
+
+    # Mean over individuals -> one value per generation
+    mean_fitness = {f: history[:, :, i].mean(axis=1) for i, f in enumerate(FITNESS_FUNCTIONS)}
+    mean_weights = {f: history[:, :, n + i].mean(axis=1) for i, f in enumerate(FITNESS_FUNCTIONS)}
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    for f in FITNESS_FUNCTIONS:
+        ax1.plot(time, mean_weights[f], label=f"w_{f}")
+    ax1.set_title(f"Mean parameter weights ({method}, seed {seed})")
+    ax1.set_xlabel("Generation")
+    ax1.set_ylabel("Mean weight")
+    ax1.legend()
+
+    for f in FITNESS_FUNCTIONS:
+        ax2.plot(time, mean_fitness[f], label=f)
+    ax2.set_title(f"Mean raw fitness values ({method}, seed {seed})")
+    ax2.set_xlabel("Generation")
+    ax2.set_ylabel("Mean fitness")
+    ax2.legend()
+
+    plt.tight_layout()
+    os.makedirs(DATA / "__plots__", exist_ok=True)
+    path = DATA / "__plots__" / f"{method}_seed{seed}.png"
+    fig.savefig(path, dpi=150)
+    print(f"Saved plot to {path}")
+    plt.close(fig)
+    return time, mean_fitness, mean_weights
+
 
 def experimental_run(pop_size, time, amount_of_runs, initial_seed = 42):
     """
     This is where we run our experiment
     """
     global RNG
-    os.makedirs(DATA/"__history__", exist_ok=True)
     # We define the different types of methods that we
     # want to test in our experiment:
     for method in METHODS:
@@ -584,6 +777,7 @@ def experimental_run(pop_size, time, amount_of_runs, initial_seed = 42):
         seed = initial_seed
         for i in range(amount_of_runs):
             RNG = np.random.default_rng(seed)
+            random.seed(seed)
             set_seed(seed)
             print(f"Experiment {i}:", end = " ")
             individual_experimental(pop_size, time, seed, method=method)
@@ -594,10 +788,14 @@ def experimental_run(pop_size, time, amount_of_runs, initial_seed = 42):
 
 
 if __name__ == "__main__":
+    #individual_experimental(10, 20, seed = 42, method ="self-adaptive")
+    history = np.load(DATA / "__history__" / f"self-adaptive_seed{42}.npy")
+    statistics("self-adaptive", 42)
     # experimental_run(5, 5, amount_of_runs=2, initial_seed=42)
-    for method in METHODS:
-        history = np.load(DATA / "__history__" / f"{method}_seed{42}.npy")
-        print(history.shape)
+    # for method in METHODS:
+    #     history = np.load(DATA / "__history__" / f"{method}_seed{42}.npy")
+    #     print(history.shape)
+    #     print(history[0][0])
 
 # ============================================================================ #
 #  YOUR JOB
@@ -636,3 +834,67 @@ if __name__ == "__main__":
 #     everything you compare. Change one thing at a time.
 #
 # ============================================================================ #
+
+
+# def fitness_per_method(individual: Individual, method:str)->float:
+#     """
+#     :param method: determines which method we use:
+#     The individual functions:
+#     locomotion, efficiency, direct, speed
+#     The combined functions:
+#     sum, threshold, self-adaptive
+#     :return:
+#     """
+#     if method == "locomotion":
+#         return individual.tags["locomotion"]
+#     elif method == "efficiency":
+#         return individual.tags["efficiency"]
+#     elif method == "direct":
+#         return individual.tags["direct"]
+#     elif method == "speed":
+#         return individual.tags["speed"]
+#     elif method == "sum":
+#         # we determine the values
+#         return 10
+#     elif method == "threshold":
+#
+#         a = individual.tags["locomotion"] * individual.tags["alpha"]
+#         b = individual.tags["efficiency"] * individual.tags["beta"]
+#         c = individual.tags["direct"] * individual.tags["gamma"]
+#         d = individual.tags["speed"] * individual.tags["sigma"]
+#         return a + b + c + d
+#     elif method == "self-adaptive":
+#         #ToDo create the self adaptive function
+#         return 10
+#     raise ValueError(f"Unknown method: {method}")
+
+
+# def best_fitness_rate_of_change(lookback_size): #we look at the last n = 10 generations, if it doesnt chnage tahts a plateau
+#     #we can aslo use this function to end the simulation if it stays the same for a long time
+#     """
+#     Calculates the mean rate of change of the best combined
+#     fitness over the last n generations.
+#
+#     The combined fitness is the sum of the four fitness values.
+#     Lower is better because this is a minimization problem.
+#
+#     Negative = improvement.
+#     Positive = deterioration.
+#     """
+#     global HISTORY
+#     if  len(HISTORY) < lookback_size:
+#         return 100
+#     # We take the last individuals
+#     last = np.stack(HISTORY[-(lookback_size + 1):])
+#     # We then calculate the fitness value for the
+#     # given method. NOTE:  the last four values in the history
+#     # correspond to the parameter weights
+#     A = AMOUNT_OF_FUNCTIONS
+#     fitness_per_individual = (last[:, :, :A] * last[:, :, A:2 * A]).sum(axis=2)
+#     best_per_generation = fitness_per_individual.min(axis=1)
+#     # Change between consecutive generations
+#     changes = np.diff(best_per_generation)
+#
+#     # Mean rate of change
+#     return changes.mean()
+
