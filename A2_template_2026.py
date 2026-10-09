@@ -739,14 +739,7 @@ def statistics(method:str, seed: int):
     w_speed = history[:,:,FITNESS_FUNCTIONS.index("speed") +4]
     w_efficiency = history[:,:,FITNESS_FUNCTIONS.index("efficiency")+4]
 
-    time = np.arange(0,len(locomotion))
-    plt.plot(time, w_locomotion.mean(axis=1), label="w_locomotion")
-    plt.plot(time, w_direct.mean(axis=1), label="w_direct")
-    plt.plot(time, w_speed.mean(axis=1), label="w_speed")
-    plt.plot(time, w_efficiency.mean(axis=1), label="w_efficiency")
-    plt.title("Mean values")
-    plt.legend()
-    plt.show()
+    print(w_efficiency)
 
 
 def experimental_run(pop_size, time, amount_of_runs, initial_seed = 42):
