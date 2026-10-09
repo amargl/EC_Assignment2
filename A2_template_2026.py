@@ -249,6 +249,7 @@ STAGES = [
 ]
 LOOKBACK = 25
 RATE_THRESHOLD = 1e-5 #needs to be very small because the bounds setting
+###what does this mean?
 STAGE = 0
 BEST_IN_STAGE: list[float] = []
 
@@ -267,6 +268,7 @@ BOUNDS = {
     "speed":      (0.0, 1.0 + D),
     "efficiency": (-D, D + 0.5),
 }
+###what do these bounds mean, what is the justification? whhy do this before normalizing?
 
 def normalise(value: float, func: str) -> float:
     lo, hi = BOUNDS[func]
