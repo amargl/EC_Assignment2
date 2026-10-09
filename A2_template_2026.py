@@ -25,7 +25,6 @@ a rendered video, or a single frame.
 """
 import copy
 import random
-from crypt import methods
 # Standard library
 from pathlib import Path
 from typing import Literal
@@ -729,39 +728,25 @@ def individual_experimental(pop_size:int, time:int, seed:int, method:str="locomo
 def statistics(method:str, seed: int):
     #ToDo make the statistic statisizing
     # history has the form  (generations, pop_size, n_fitness_functions)
-    history = np.load(DATA / "__history__" / f"{method}_seed{seed}.npy")
-    # history: (generations, pop_size, len(COLUMNS))
+    history = np.load(DATA / "__history__"/ f"{method}_seed{seed}.npy")
+    locomotion = history[:,:,FITNESS_FUNCTIONS.index("locomotion")]
+    direct = history[:,:,FITNESS_FUNCTIONS.index("direct")]
+    speed = history[:,:,FITNESS_FUNCTIONS.index("speed")]
+    efficiency = history[:,:,FITNESS_FUNCTIONS.index("efficiency")]
 
-    n = len(FITNESS_FUNCTIONS)
-    time = np.arange(history.shape[0])
+    w_locomotion = history[:,:,FITNESS_FUNCTIONS.index("locomotion") +4]
+    w_direct = history[:,:,FITNESS_FUNCTIONS.index("direct") +4]
+    w_speed = history[:,:,FITNESS_FUNCTIONS.index("speed") +4]
+    w_efficiency = history[:,:,FITNESS_FUNCTIONS.index("efficiency")+4]
 
-    # Mean over individuals -> one value per generation
-    mean_fitness = {f: history[:, :, i].mean(axis=1) for i, f in enumerate(FITNESS_FUNCTIONS)}
-    mean_weights = {f: history[:, :, n + i].mean(axis=1) for i, f in enumerate(FITNESS_FUNCTIONS)}
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    for f in FITNESS_FUNCTIONS:
-        ax1.plot(time, mean_weights[f], label=f"w_{f}")
-    ax1.set_title(f"Mean parameter weights ({method}, seed {seed})")
-    ax1.set_xlabel("Generation")
-    ax1.set_ylabel("Mean weight")
-    ax1.legend()
-
-    for f in FITNESS_FUNCTIONS:
-        ax2.plot(time, mean_fitness[f], label=f)
-    ax2.set_title(f"Mean raw fitness values ({method}, seed {seed})")
-    ax2.set_xlabel("Generation")
-    ax2.set_ylabel("Mean fitness")
-    ax2.legend()
-
-    plt.tight_layout()
-    os.makedirs(DATA / "__plots__", exist_ok=True)
-    path = DATA / "__plots__" / f"{method}_seed{seed}.png"
-    fig.savefig(path, dpi=150)
-    print(f"Saved plot to {path}")
-    plt.close(fig)
-    return time, mean_fitness, mean_weights
+    time = np.arange(0,len(locomotion))
+    plt.plot(time, w_locomotion.mean(axis=1), label="w_locomotion")
+    plt.plot(time, w_direct.mean(axis=1), label="w_direct")
+    plt.plot(time, w_speed.mean(axis=1), label="w_speed")
+    plt.plot(time, w_efficiency.mean(axis=1), label="w_efficiency")
+    plt.title("Mean values")
+    plt.legend()
+    plt.show()
 
 
 def experimental_run(pop_size, time, amount_of_runs, initial_seed = 42):
